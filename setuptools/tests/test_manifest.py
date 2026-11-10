@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import unicodedata
 
 import pytest
 
@@ -155,6 +156,21 @@ def test_translated_pattern_match(pattern_match):
 def test_translated_pattern_mismatch(pattern_mismatch):
     pattern, target = pattern_mismatch
     assert not translate_pattern(pattern).match(target)
+
+
+def test_translate_pattern_unicode_normalization():
+    """
+    Matching is insensitive to Unicode normalization form: a pattern authored
+    in one form matches a path stored on disk in another (and vice versa), so
+    that an exclusion cannot be bypassed by an NFC/NFD mismatch.
+
+    Regression test for GHSA-h35f-9h28-mq5c.
+    """
+    nfc = unicodedata.normalize('NFC', 'café.txt')  # 'café.txt' composed
+    nfd = unicodedata.normalize('NFD', 'café.txt')  # 'café.txt' decomposed
+    assert nfc != nfd  # the two byte forms genuinely differ
+    assert translate_pattern(nfc).match(nfd)
+    assert translate_pattern(nfd).match(nfc)
 
 
 class TempDirTestCase:
@@ -330,6 +346,35 @@ class TestManifestTest(TempDirTestCase):
         )
         files = default_files | set([ml('app/a.txt'), ml('app/b.txt'), ml('app/c.rst')])
         assert files == self.get_files()
+
+    def test_global_exclude_unicode_normalization(self):
+        """
+        A ``global-exclude`` authored NFC must drop a file whose on-disk name
+        is NFD: on macOS APFS/HFS+ the two are the same file, and even on
+        case/normalization-exact filesystems the decomposed name can be
+        committed and reach the build. Otherwise the file is published in the
+        sdist despite the exclusion.
+
+        Regression test for GHSA-h35f-9h28-mq5c.
+        """
+        nfc_name = unicodedata.normalize('NFC', 'café.txt')
+        nfd_name = unicodedata.normalize('NFD', 'café.txt')
+        assert nfc_name != nfd_name
+        # write the file under its decomposed (NFD) name ...
+        touch(os.path.join(self.temp_dir, 'app', nfd_name))
+        # ... and exclude it with the composed (NFC) form.
+        self.make_manifest(
+            f"""
+            global-include *.txt
+            global-exclude {nfc_name}
+            """
+        )
+        leaked = {
+            f
+            for f in self.get_files()
+            if unicodedata.normalize('NFC', os.path.basename(f)) == nfc_name
+        }
+        assert not leaked, f"excluded file leaked into manifest: {leaked}"
 
 
 class TestFileListTest(TempDirTestCase):
@@ -620,3 +665,33 @@ class TestFileListTest(TempDirTestCase):
         file_list.sort()
         assert file_list.files == ['a.py', ml('f/f.py')]
         self.assertWarnings(caplog)
+
+    @pytest.mark.parametrize(
+        ("line", "path"),
+        [
+            ('exclude {name}.txt', '{name}.txt'),
+            ('global-exclude {name}.txt', 'd/{name}.txt'),
+            ('recursive-exclude d {name}.txt', 'd/e/{name}.txt'),
+            ('recursive-exclude {name} *.txt', '{name}/e/a.txt'),
+            ('prune {name}', '{name}/a.txt'),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("pattern_form", "path_form"), [('NFC', 'NFD'), ('NFD', 'NFC')]
+    )
+    def test_exclude_unicode_normalization(self, line, path, pattern_form, path_form):
+        """
+        Every exclusion directive drops a file whose name is stored in a
+        different Unicode normalization form than the ``MANIFEST.in`` pattern.
+
+        Regression test for GHSA-h35f-9h28-mq5c.
+        """
+        name = 'café'
+        pattern_name = unicodedata.normalize(pattern_form, name)
+        path_name = unicodedata.normalize(path_form, name)
+        assert pattern_name != path_name
+        file_list = FileList()
+        file_list.files = ['keep.txt', make_local_path(path.format(name=path_name))]
+
+        file_list.process_template_line(line.format(name=pattern_name))
+        assert file_list.files == ['keep.txt']
